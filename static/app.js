@@ -28,6 +28,7 @@ async function newExperiment() {
   $("exp-id").textContent = expId;
   clearError("a");
   clearError("b");
+  clearError("ckpt");
   await refreshStatus();
   await refreshCommitted();
 }
@@ -37,6 +38,7 @@ async function refreshStatus() {
   const data = await fetchJson(`/api/experiments/${expId}/status`);
   renderPanel("a", data.a);
   renderPanel("b", data.b);
+  renderCheckpoint(data.checkpoint);
 }
 
 async function refreshCommitted() {
@@ -69,6 +71,34 @@ function renderPanel(side, state) {
     const li = document.createElement("li");
     li.textContent = entry;
     if (entry.includes("→ 失败") || entry.includes("→ 拒绝")) {
+      li.classList.add("log-error");
+    }
+    logEl.appendChild(li);
+  }
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function renderCheckpoint(state) {
+  // 只渲染服务端内存中的最近结果缓存：轮询本身不触发检查点
+  const resultEl = $("ckpt-result");
+  const last = state && state.last;
+  if (!last) {
+    resultEl.textContent = "尚未执行过检查点";
+    resultEl.classList.remove("busy");
+  } else {
+    resultEl.textContent =
+      `最近一次 ${last.mode}：busy=${last.busy}，` +
+      `WAL 总帧数=${last.log_frames}，已回写帧数=${last.checkpointed}，` +
+      `WAL 文件大小=${last.wal_size} 字节`;
+    resultEl.classList.toggle("busy", last.busy === 1);
+  }
+
+  const logEl = $("log-ckpt");
+  logEl.innerHTML = "";
+  for (const entry of (state && state.log) || []) {
+    const li = document.createElement("li");
+    li.textContent = entry;
+    if (entry.includes("失败") || entry.includes("busy=1")) {
       li.classList.add("log-error");
     }
     logEl.appendChild(li);
@@ -141,6 +171,32 @@ function bindPanel(side) {
   }
 }
 
+function setCheckpointBusy(busy) {
+  // 检查点请求进行中只禁用检查点按钮，甲、乙两栏照常可用
+  $("ckpt-passive").disabled = busy;
+  $("ckpt-truncate").disabled = busy;
+}
+
+async function doCheckpoint(mode) {
+  setCheckpointBusy(true);
+  clearError("ckpt");
+  try {
+    const data = await fetchJson(`/api/experiments/${expId}/checkpoint/${mode}`, {
+      method: "POST",
+    });
+    renderCheckpoint(data.state);
+    if (!data.ok && data.error) {
+      showError("ckpt", data.error);
+    }
+  } catch (e) {
+    if (!(e instanceof ExpGone)) {
+      showError("ckpt", { name: null, code: null, message: "请求失败：" + e.message });
+    }
+  } finally {
+    setCheckpointBusy(false);
+  }
+}
+
 async function init() {
   bindPanel("a");
   bindPanel("b");
@@ -149,6 +205,12 @@ async function init() {
   });
   $("refresh-committed").addEventListener("click", () => {
     refreshCommitted();
+  });
+  $("ckpt-passive").addEventListener("click", () => {
+    doCheckpoint("PASSIVE").catch(() => {});
+  });
+  $("ckpt-truncate").addEventListener("click", () => {
+    doCheckpoint("TRUNCATE").catch(() => {});
   });
 
   const params = new URLSearchParams(location.search);

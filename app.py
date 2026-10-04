@@ -10,6 +10,13 @@
 checked_add 函数做最终精确判定，绝不先在本连接上 SELECT —— 否则
 首次写锁冲突（SQLITE_BUSY）后本事务会留下读快照，对方提交释放写锁后
 重试即被误报为 SQLITE_BUSY_SNAPSHOT。
+
+WAL 检查点（PASSIVE / TRUNCATE）不由甲、乙两栏的连接执行，而是每次
+用一条全新的独立连接真实执行 PRAGMA wal_checkpoint，busy_timeout=0：
+读事务阻止回收时立即返回 busy=1，不等待。各写连接均已关闭自动检查点
+（PRAGMA wal_autocheckpoint=0），检查点时机完全由手动按钮 / HTTP 控制。
+检查点绝不代替两栏提交、回滚，也不替换连接；状态刷新只读取内存中
+最近一次检查点结果的缓存，不执行任何 SQL、不触发检查点。
 """
 
 import os
@@ -40,6 +47,10 @@ OP_LABELS = {
     "commit": "COMMIT",
     "rollback": "ROLLBACK",
 }
+
+# 允许手动触发的检查点模式：SQL 片段直接拼入 PRAGMA，必须走白名单
+VALID_CHECKPOINT_MODES = {"PASSIVE", "TRUNCATE"}
+WAL_SUFFIX = "-wal"
 
 app = Flask(__name__)
 
@@ -88,18 +99,24 @@ class Experiment:
         # 两栏各自的长期连接：isolation_level=None 进入自动提交模式，
         # 事务完全由显式 BEGIN/COMMIT/ROLLBACK 控制；
         # busy_timeout=0 让写锁冲突立即报错而不是等待。
+        # 两个写连接均关闭自动检查点（wal_autocheckpoint=0），
+        # 使 WAL 回收只由手动 PASSIVE / TRUNCATE 检查点触发。
         # overflow_flags 供连接上的 checked_add 函数在判定 64 位溢出时置位，
         # 以便把溢出与普通 SQLite 错误区分开，沿用既有的拒绝响应。
         self.overflow_flags = {"a": [False], "b": [False]}
         self.conns = {
-            "a": self._open_conn(self.overflow_flags["a"]),
-            "b": self._open_conn(self.overflow_flags["b"]),
+            "a": self._open_conn(self.overflow_flags["a"], autockpt=False),
+            "b": self._open_conn(self.overflow_flags["b"], autockpt=False),
         }
         self.conn_locks = {"a": threading.Lock(), "b": threading.Lock()}
         # 第三条连接：只读已提交值
         self.observer = self._open_conn()
         self.observer_lock = threading.Lock()
         self.panels = {"a": PanelState(), "b": PanelState()}
+        # 检查点状态只保存在内存：状态刷新只读这份缓存，不触发检查点
+        self.checkpoint_lock = threading.Lock()
+        self.checkpoint_last = None
+        self.checkpoint_log = []
 
     def _init_db(self):
         conn = sqlite3.connect(self.db_path)
@@ -114,12 +131,16 @@ class Experiment:
         finally:
             conn.close()
 
-    def _open_conn(self, overflow_flag=None):
+    def _open_conn(self, overflow_flag=None, autockpt=True):
         conn = sqlite3.connect(
             self.db_path, timeout=0, isolation_level=None, check_same_thread=False
         )
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=0")
+        if not autockpt:
+            # 关闭本连接提交时的自动检查点：检查点时机完全交由
+            # 手动 PASSIVE / TRUNCATE 按钮（HTTP）控制。
+            conn.execute("PRAGMA wal_autocheckpoint=0")
         if overflow_flag is not None:
             # checked_add 在 UPDATE 内部做最终的 64 位边界判定。
             # SQLite 对整数溢出不报错而会静默存成 REAL，必须在写入前拦下：
@@ -151,6 +172,22 @@ class Experiment:
                 "SELECT val FROM kv WHERE id = 1"
             ).fetchone()
             return row[0]
+
+    def checkpoint_state(self):
+        # 只读内存缓存：不执行任何 SQL、不触发检查点
+        return {"last": self.checkpoint_last, "log": list(self.checkpoint_log)}
+
+    def add_checkpoint_log(self, text):
+        self.checkpoint_log.append("%s  %s" % (time.strftime("%H:%M:%S"), text))
+        if len(self.checkpoint_log) > MAX_LOG_ENTRIES:
+            del self.checkpoint_log[: len(self.checkpoint_log) - MAX_LOG_ENTRIES]
+
+    def wal_size(self):
+        # 操作后读取 WAL 文件字节数；文件不存在时记 0
+        try:
+            return os.path.getsize(self.db_path + WAL_SUFFIX)
+        except OSError:
+            return 0
 
 
 def run_op(exp, side, op, value):
@@ -251,6 +288,74 @@ def run_op(exp, side, op, value):
     return {"ok": True, "error": None, "state": exp.panel_state(side)}
 
 
+def run_checkpoint(exp, mode):
+    """用全新的独立连接真实执行 PRAGMA wal_checkpoint(<mode>)。
+
+    busy_timeout=0：读事务阻止回收时立即返回 busy=1，绝不等待。
+    检查点不替代两栏提交 / 回滚，也不触碰甲、乙的长期连接。
+    """
+    mode = (mode or "").upper()
+    if mode not in VALID_CHECKPOINT_MODES:
+        return {
+            "ok": False,
+            "error": {"name": None, "code": None, "message": "unknown checkpoint mode"},
+            "state": exp.checkpoint_state(),
+        }
+    with exp.checkpoint_lock:
+        # 每次一条独立连接：不用甲、乙或 observer，避免把检查点和
+        # 两栏的事务状态、读快照绑定在一起。该连接不是最后一个连接，
+        # 关闭时不会触发默认检查点；busy_timeout=0 使 busy 立即返回。
+        ckpt_conn = sqlite3.connect(exp.db_path, timeout=0, isolation_level=None)
+        try:
+            ckpt_conn.execute("PRAGMA busy_timeout=0")
+            try:
+                row = ckpt_conn.execute(
+                    "PRAGMA wal_checkpoint(%s)" % mode
+                ).fetchone()
+            except sqlite3.Error as exc:
+                name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+                code = getattr(exc, "sqlite_errorcode", None)
+                result = {
+                    "mode": mode,
+                    "busy": None,
+                    "log_frames": None,
+                    "checkpointed": None,
+                    "wal_size": exp.wal_size(),
+                }
+                exp.checkpoint_last = result
+                exp.add_checkpoint_log(
+                    "%s → 失败 [%s (%s)] %s" % (mode, name, code, exc)
+                )
+                return {
+                    "ok": False,
+                    "error": {"name": name, "code": code, "message": str(exc)},
+                    "state": exp.checkpoint_state(),
+                }
+        finally:
+            ckpt_conn.close()
+        # SQLite 原样返回三项：busy、WAL 总帧数 log、已回写帧数 checkpointed
+        busy, log_frames, checkpointed = row[0], row[1], row[2]
+        result = {
+            "mode": mode,
+            "busy": busy,
+            "log_frames": log_frames,
+            "checkpointed": checkpointed,
+            "wal_size": exp.wal_size(),
+        }
+        exp.checkpoint_last = result
+        if busy:
+            tail = "检查点被并发读事务阻止（busy=1）"
+        elif checkpointed < log_frames:
+            tail = "回写未完成（%d/%d 帧）" % (checkpointed, log_frames)
+        else:
+            tail = "回写完成（%d/%d 帧）" % (checkpointed, log_frames)
+        exp.add_checkpoint_log(
+            "%s → busy=%d，WAL 总帧数=%d，已回写帧数=%d，WAL=%d 字节，%s"
+            % (mode, busy, log_frames, checkpointed, result["wal_size"], tail)
+        )
+    return {"ok": True, "error": None, "state": exp.checkpoint_state(), **result}
+
+
 # 实验注册表：仅保存在内存中，无需跨重启保留
 experiments = {}
 experiments_lock = threading.Lock()
@@ -280,8 +385,14 @@ def experiment_status(exp_id):
     exp = get_experiment(exp_id)
     if exp is None:
         return jsonify({"error": "experiment not found"}), 404
+    # 两栏状态与检查点状态均来自内存缓存，不执行任何 SQL、不触发检查点
     return jsonify(
-        {"id": exp.id, "a": exp.panel_state("a"), "b": exp.panel_state("b")}
+        {
+            "id": exp.id,
+            "a": exp.panel_state("a"),
+            "b": exp.panel_state("b"),
+            "checkpoint": exp.checkpoint_state(),
+        }
     )
 
 
@@ -291,6 +402,21 @@ def experiment_committed(exp_id):
     if exp is None:
         return jsonify({"error": "experiment not found"}), 404
     return jsonify({"committed": json_int(exp.committed_value())})
+
+
+@app.post("/api/experiments/<exp_id>/checkpoint")
+@app.post("/api/experiments/<exp_id>/checkpoint/<mode>")
+def experiment_checkpoint(exp_id, mode=None):
+    exp = get_experiment(exp_id)
+    if exp is None:
+        return jsonify({"error": "experiment not found"}), 404
+    if mode is None:
+        data = request.get_json(silent=True) or {}
+        mode = data.get("mode")
+    mode = (mode or "").upper()
+    if mode not in VALID_CHECKPOINT_MODES:
+        return jsonify({"error": "mode must be PASSIVE or TRUNCATE"}), 400
+    return jsonify(run_checkpoint(exp, mode))
 
 
 @app.post("/api/experiments/<exp_id>/conn/<side>/op")

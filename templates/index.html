@@ -62,8 +62,25 @@
     </section>
   </main>
 
+  <section class="checkpoint" id="checkpoint">
+    <h2>WAL 检查点（独立连接真实执行 <code>PRAGMA wal_checkpoint</code>，busy_timeout=0）</h2>
+    <div class="controls">
+      <button type="button" id="ckpt-passive">PASSIVE 检查点</button>
+      <button type="button" id="ckpt-truncate">TRUNCATE 检查点</button>
+      <span class="ckpt-result" id="ckpt-result">尚未执行过检查点</span>
+    </div>
+    <div class="error-box" id="error-ckpt" hidden></div>
+    <p class="ckpt-hint">各写连接已关闭自动检查点（<code>PRAGMA wal_autocheckpoint=0</code>）；
+       检查点每次使用全新的独立连接，不代替甲、乙提交 / 回滚，也不替换连接。
+       返回 SQLite 原始三项：<b>busy</b>、<b>WAL 总帧数</b>、<b>已回写帧数</b>，
+       以及操作后 WAL 文件字节数（文件不存在记 0）。读事务未结束时，PASSIVE
+       回写未完成（已回写帧数为 0），TRUNCATE 立即返回 busy=1。</p>
+    <ol class="log" id="log-ckpt"></ol>
+  </section>
+
   <footer>
-    <p>说明：状态刷新不执行任何 SELECT，不会为 DEFERRED 事务提前建立快照；写锁冲突会立即返回
+    <p>说明：状态刷新不执行任何 SELECT，不会为 DEFERRED 事务提前建立快照，也不触发检查点
+       （检查点结果只读内存缓存）；写锁冲突会立即返回
        SQLite 错误名与错误码，不阻塞另一栏，也不会自动结束失败的事务；修改操作只允许在事务内进行。</p>
   </footer>
 

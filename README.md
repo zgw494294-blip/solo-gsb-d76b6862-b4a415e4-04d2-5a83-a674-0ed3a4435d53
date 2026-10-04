@@ -19,6 +19,12 @@
   observer 连接的已提交值预判，最终判定在 `UPDATE` 内的 `checked_add`
   函数中完成，因此不会把 `SQLITE_BUSY` 误报成 `SQLITE_BUSY_SNAPSHOT`
 - 修改操作（加上）只允许在事务内进行，禁止事务外修改
+- 手动 **PASSIVE / TRUNCATE 检查点**按钮（也可 HTTP 调用）：每次用一条全新的
+  独立连接真实执行 `PRAGMA wal_checkpoint`，`busy_timeout=0`，读事务阻止回收时
+  立即返回 `busy=1`；各写连接已关闭自动检查点（`PRAGMA wal_autocheckpoint=0`）
+- 检查点结果显示模式与 SQLite 原始三项（**busy、WAL 总帧数、已回写帧数**）及
+  操作后 WAL 文件字节数（文件不存在记 0）；状态刷新只读内存缓存，不触发检查点
+- 检查点不代替两栏提交 / 回滚，也不替换任何连接
 - 实验仅保存在内存中，无需跨重启保留
 
 ## 数值约定
@@ -95,6 +101,67 @@ docker compose up --build
    （修复前 SQLite 会静默存成浮点数 `1.2e+19`）
 4. 甲的事务仍然开启，前两次结果保留：可 `提交`
    （已提交值变为 **8000000000000000100**），也可 `回滚`（已提交值保持 100）
+
+### 示例五：读事务阻止 WAL 回收（手动 PASSIVE / TRUNCATE 检查点）
+
+> 检查点每次由**独立的全新连接**真实执行 `PRAGMA wal_checkpoint(...)`，
+> `busy_timeout=0`；甲、乙两栏的写连接均已关闭自动检查点
+> （`PRAGMA wal_autocheckpoint=0`），不点击按钮 / 不调 HTTP 就不会发生检查点。
+> 返回值为 SQLite 原始三项：`busy`、`log`（WAL 总帧数）、
+> `checkpointed`（已回写帧数），另附操作后 WAL 文件字节数。
+
+1. 甲：`BEGIN DEFERRED` → `读值` → 显示 **100**（读事务建立读快照）
+2. 乙：`BEGIN DEFERRED` → 输入 `10` → `加上` → `提交`
+   （顶部「已提交值」变为 **110**，WAL 新增 1 帧）
+3. 点击 **PASSIVE 检查点** → 显示 **busy=0，WAL 总帧数=1，已回写帧数=0，
+   WAL=4152 字节，回写未完成（0/1 帧）**（4152 = 32 字节 WAL 头 + 24 字节帧头 +
+   4096 字节数据页，即默认页大小下的 1 帧；若页大小不同字节数相应变化）：
+   甲的读快照还停留在该帧之前，SQLite 不能把帧回写到主库，WAL 也不能被复用 / 截断
+4. 点击 **TRUNCATE 检查点** → **立即**返回 **busy=1，WAL 总帧数=1，
+   已回写帧数=0，WAL=4152 字节**（`busy_timeout=0` 不等待）；
+   甲此时再点 `读值` 仍为 **100**（检查点不改变甲的快照，也不提交 / 回滚甲的事务）
+5. 甲：`回滚`（读事务结束，不再有连接保留旧读快照）
+6. 再次点击 **TRUNCATE 检查点** → **busy=0，WAL 总帧数=0，已回写帧数=0，
+   WAL=0 字节**，即 SQLite 原始结果 `(0,0,0)`，WAL 文件被截断为 0 字节
+7. 顶部「已提交值」仍为 **110**：检查点只负责把已提交的帧搬回主库，
+   不会撤销乙的提交
+
+> 页面上的状态轮询只返回最近一次检查点结果的内存缓存，不执行任何 SQL、
+> 不触发检查点；检查点按钮请求进行中只禁用检查点按钮，甲、乙两栏照常操作。
+
+#### HTTP 调用示例
+
+检查点接口既接受路径参数，也接受 JSON body（模式大小写均可）：
+
+```bash
+EXP=<新建实验返回的 id>
+
+# PASSIVE 检查点（路径形式）
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/checkpoint/PASSIVE
+# {"busy":0,"checkpointed":0,"log_frames":1,"mode":"PASSIVE","ok":true,
+#  "wal_size":4152, ...}   读事务未结束时已回写帧数为 0，WAL 保持 4152 字节
+
+# TRUNCATE 检查点（JSON body 形式）
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/checkpoint \
+  -H 'Content-Type: application/json' -d '{"mode":"TRUNCATE"}'
+# 甲未回滚时：{"busy":1,"checkpointed":0,"log_frames":1,"wal_size":4152,...}
+# 甲回滚后：  {"busy":0,"checkpointed":0,"log_frames":0,"wal_size":0,...}
+```
+
+甲、乙两栏操作仍使用原接口，例如：
+
+```bash
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"read"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":10}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"commit"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"rollback"}'
+```
 
 > 提示：一栏的请求未完成时，该栏按钮会被禁用，另一栏仍可正常操作；
 > 两栏的状态轮询与「已提交值」均通过独立连接 / 内存状态完成，
