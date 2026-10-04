@@ -19,6 +19,15 @@
   observer 连接的已提交值预判，最终判定在 `UPDATE` 内的 `checked_add`
   函数中完成，因此不会把 `SQLITE_BUSY` 误报成 `SQLITE_BUSY_SNAPSHOT`
 - 修改操作（加上）只允许在事务内进行，禁止事务外修改
+- 页面提供 **PASSIVE / TRUNCATE 手动检查点按钮**，也可通过 HTTP 调用；
+  每次检查点都由一条**全新的临时独立连接**真实执行
+  `PRAGMA wal_checkpoint(PASSIVE|TRUNCATE)`，`busy_timeout=0`，
+  执行完立即关闭，各连接关闭时保留 SQLite 默认的自动检查点行为
+- 检查点返回并显示：检查点**模式**、SQLite 原始三项结果
+  **(busy、WAL 总帧数、已回写帧数)**，以及操作后 **WAL 文件字节数**
+  （`-wal` 文件不存在时大小记 0）
+- 检查点不替甲、乙两栏提交 / 回滚，也不更换两栏连接；状态刷新只读内存
+  缓存，不执行任何 `SELECT` 或 `PRAGMA wal_checkpoint`，**不会触发检查点**
 - 实验仅保存在内存中，无需跨重启保留
 
 ## 数值约定
@@ -77,6 +86,90 @@ docker compose up --build
    乙的事务仍开启，系统**不会**自动回滚、不替换连接、也不改变事务类型
 4. 乙：`回滚` → `BEGIN DEFERRED` → 输入 `7` → `加上` → `提交`
    （已提交值变为 **112**）
+
+### 示例二补充二：读事务阻止 WAL 回收（PASSIVE 回写未完成 / TRUNCATE busy）
+
+观察一个尚未结束的读事务怎样阻止检查点回收 WAL。
+
+1. 甲：`BEGIN DEFERRED` → `读值` → 显示 **100**（甲建立读快照，WAL 读位置停在 0）
+2. 乙：`BEGIN DEFERRED` → 输入 `10` → `加上` → `提交`
+   （顶部「已提交值」变为 **110**，WAL 新增 1 个帧）
+3. 点击 **PASSIVE 检查点**：显示
+   `busy=0，WAL总帧数=1，已回写帧数=0，WAL 文件 4152 字节` ——
+   **回写未完成**：甲的读事务还在用旧版本，SQLite 不能把该帧覆盖进主库，
+   PASSIVE 不等待也不报错
+4. 点击 **TRUNCATE 检查点**：**立即**返回
+   `busy=1，WAL总帧数=1，已回写帧数=0，WAL 文件 4152 字节` ——
+   帧仍未回写，无法独占重启 / 截断 WAL（`busy_timeout=0`，不阻塞等待）
+5. 甲：`读值` → 仍是 **100**（甲的快照不受乙的提交和检查点影响）
+6. 甲：`回滚`（读事务结束，已提交值仍是 **110**）
+7. 再次点击 **TRUNCATE 检查点**：得到
+   `busy=0，WAL总帧数=0，已回写帧数=0，WAL 文件 0 字节`（WAL 被回写并截断；
+   计数为 0 是截断成功后 wal-index 头被重启清零的原始返回），
+   顶部「已提交值」仍为 **110**
+
+> 说明：三项数字直接取自 SQLite `PRAGMA wal_checkpoint` 返回行的原始整数：
+> 第 1 列 busy（是否因活动读者未完成），第 2 列 WAL 总帧数，第 3 列已回写帧数；
+> WAL 字节数为操作结束后磁盘上 `exp_<id>.db-wal` 的大小，文件不存在记 0。
+> 检查点由临时独立连接执行，不会替甲、乙提交或回滚，也不更换两栏连接；
+> 页面状态轮询只读服务端内存里的最近结果，不会重新执行检查点。
+
+#### 对应的 HTTP 调用示例
+
+先记下「实验 ID」（或从新建实验接口获取，下文以 `$E` 代替）：
+
+```bash
+# 新建实验，拿到 12 位 ID
+curl -s -X POST http://localhost:8000/api/experiments
+# {"id":"a1b2c3d4e5f6"}
+E=a1b2c3d4e5f6
+BASE=http://localhost:8000/api/experiments/$E
+
+# 1. 甲：BEGIN DEFERRED → 读值（读到 100，读快照建立）
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' -d '{"op":"begin"}'
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' -d '{"op":"read"}'
+
+# 2. 乙：+10 并提交
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' -d '{"op":"begin"}'
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' -d '{"op":"add","value":10}'
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' -d '{"op":"commit"}'
+curl -s $BASE/committed            # {"committed":110}
+
+# 3. PASSIVE：回写未完成（甲的读事务还在）
+curl -s -X POST $BASE/checkpoint -H 'Content-Type: application/json' -d '{"mode":"PASSIVE"}'
+# {"ok":true,"error":null,
+#  "result":{"mode":"PASSIVE","busy":0,"total_frames":1,
+#            "checkpointed_frames":0,"wal_bytes":4152}}
+
+# 4. TRUNCATE：立即 busy=1，WAL 保持 4152 字节
+curl -s -X POST $BASE/checkpoint -H 'Content-Type: application/json' -d '{"mode":"TRUNCATE"}'
+# {"ok":true,"error":null,
+#  "result":{"mode":"TRUNCATE","busy":1,"total_frames":1,
+#            "checkpointed_frames":0,"wal_bytes":4152}}
+
+# 5/6. 甲仍读 100，然后回滚
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' -d '{"op":"read"}'
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' -d '{"op":"rollback"}'
+
+# 7. 再次 TRUNCATE：(0,0,0)，WAL 文件 0 字节；已提交值仍为 110
+curl -s -X POST $BASE/checkpoint -H 'Content-Type: application/json' -d '{"mode":"TRUNCATE"}'
+# {"ok":true,"error":null,
+#  "result":{"mode":"TRUNCATE","busy":0,"total_frames":0,
+#            "checkpointed_frames":0,"wal_bytes":0}}
+curl -s $BASE/committed            # {"committed":110}
+```
+
+查看最近一次检查点结果与检查点操作日志（只读缓存，不触发检查点）：
+
+```bash
+curl -s $BASE/status | python3 -m json.tool
+# ... "checkpoint": { "last": { "mode": "TRUNCATE", "busy": 0,
+#   "total_frames": 0, "checkpointed_frames": 0, "wal_bytes": 0 },
+#   "log": [ ... ] }
+```
+
+`mode` 只接受 `PASSIVE` 或 `TRUNCATE`（大小写敏感），其他值返回
+`400 {"error":"mode must be PASSIVE or TRUNCATE"}`。
 
 ### 示例三：大整数精度（9007199254741093）
 

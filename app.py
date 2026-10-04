@@ -10,6 +10,14 @@
 checked_add 函数做最终精确判定，绝不先在本连接上 SELECT —— 否则
 首次写锁冲突（SQLITE_BUSY）后本事务会留下读快照，对方提交释放写锁后
 重试即被误报为 SQLITE_BUSY_SNAPSHOT。
+
+手动检查点（PASSIVE / TRUNCATE）每次都用一条全新的独立连接真实执行
+PRAGMA wal_checkpoint，busy_timeout=0，执行完立即关闭该连接；它绝不
+复用甲、乙、observer 的连接，也不会替两栏提交、回滚或更换连接。
+检查点结果（模式、SQLite 原始 busy/log/checkpointed 三项与操作后 WAL
+文件字节数）只缓存在内存中供状态刷新只读展示——刷新状态本身不执行
+任何 PRAGMA / SELECT，不会触发检查点。所有连接均保留 SQLite 默认的
+关闭时自动检查点行为（wal_autocheckpoint 保持默认 1000 帧）。
 """
 
 import os
@@ -34,6 +42,10 @@ JS_SAFE_INT_MAX = 2 ** 53 - 1  # Number.MAX_SAFE_INTEGER，超出则用十进制
 INT_PATTERN = re.compile(r"[+-]?[0-9]+")
 
 VALID_OPS = {"begin", "read", "add", "commit", "rollback"}
+# 实验页只提供 PASSIVE / TRUNCATE 两种手动检查点，白名单同时用于杜绝
+# 向 PRAGMA 拼接任意字符串。
+VALID_CP_MODES = ("PASSIVE", "TRUNCATE")
+MAX_LOG_ENTRIES_CP = 200
 OP_LABELS = {
     "begin": "BEGIN DEFERRED",
     "read": "读值",
@@ -100,6 +112,14 @@ class Experiment:
         self.observer = self._open_conn()
         self.observer_lock = threading.Lock()
         self.panels = {"a": PanelState(), "b": PanelState()}
+        # 手动检查点串行化：每次检查点都开一条全新的临时连接执行。
+        # 与 observer 共用同一把锁，保证测得的 WAL 字节数与三项计数
+        # 不被 observer 的瞬时读事务干扰；甲、乙两栏的连接与事务不受影响。
+        self.checkpoint_lock = self.observer_lock
+        # 最近一次手动检查点的展示缓存（纯内存）；状态刷新只读它，
+        # 不重新执行 PRAGMA wal_checkpoint。
+        self.checkpoint_last = None
+        self.checkpoint_log = []
 
     def _init_db(self):
         conn = sqlite3.connect(self.db_path)
@@ -151,6 +171,64 @@ class Experiment:
                 "SELECT val FROM kv WHERE id = 1"
             ).fetchone()
             return row[0]
+
+    def wal_file_size(self):
+        """WAL 文件当前字节数；文件不存在（已截断/尚未生成）时记 0。"""
+        path = self.db_path + "-wal"
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
+    def checkpoint_state(self):
+        # 只读内存缓存，绝不触发 PRAGMA wal_checkpoint 或任何 SELECT。
+        return {"last": self.checkpoint_last, "log": list(self.checkpoint_log)}
+
+    def add_checkpoint_log(self, text):
+        self.checkpoint_log.append("%s  %s" % (time.strftime("%H:%M:%S"), text))
+        if len(self.checkpoint_log) > MAX_LOG_ENTRIES_CP:
+            del self.checkpoint_log[: len(self.checkpoint_log) - MAX_LOG_ENTRIES_CP]
+
+    def run_checkpoint(self, mode):
+        """用一条全新的独立连接真实执行 PRAGMA wal_checkpoint(mode)。
+
+        busy_timeout=0：TRUNCATE 拿不到读者锁时立即返回 busy=1，不等待。
+        返回 SQLite 原始三项整数 (busy, WAL 总帧数, 已回写帧数) 以及
+        操作结束后的 WAL 文件字节数。检查点连接执行完立刻关闭，
+        不触碰甲、乙两栏的连接与事务。
+        """
+        with self.checkpoint_lock:
+            conn = sqlite3.connect(
+                self.db_path, timeout=0, isolation_level=None,
+                check_same_thread=False,
+            )
+            try:
+                conn.execute("PRAGMA busy_timeout=0")
+                row = conn.execute(
+                    "PRAGMA wal_checkpoint(%s)" % mode
+                ).fetchone()
+                busy, total_frames, checkpointed_frames = (
+                    int(row[0]), int(row[1]), int(row[2])
+                )
+                wal_bytes = self.wal_file_size()
+            finally:
+                # 保留 SQLite 默认的关闭时自动检查点行为，不额外调整
+                # wal_autocheckpoint；本连接在此正常关闭。
+                conn.close()
+
+            result = {
+                "mode": mode,
+                "busy": busy,
+                "total_frames": total_frames,
+                "checkpointed_frames": checkpointed_frames,
+                "wal_bytes": wal_bytes,
+            }
+            self.checkpoint_last = result
+            self.add_checkpoint_log(
+                "%s → (%d, %d, %d)，WAL %d 字节"
+                % (mode, busy, total_frames, checkpointed_frames, wal_bytes)
+            )
+            return result
 
 
 def run_op(exp, side, op, value):
@@ -281,7 +359,13 @@ def experiment_status(exp_id):
     if exp is None:
         return jsonify({"error": "experiment not found"}), 404
     return jsonify(
-        {"id": exp.id, "a": exp.panel_state("a"), "b": exp.panel_state("b")}
+        {
+            "id": exp.id,
+            "a": exp.panel_state("a"),
+            "b": exp.panel_state("b"),
+            # 仅回传内存中的检查点缓存，刷新状态不触发检查点。
+            "checkpoint": exp.checkpoint_state(),
+        }
     )
 
 
@@ -291,6 +375,34 @@ def experiment_committed(exp_id):
     if exp is None:
         return jsonify({"error": "experiment not found"}), 404
     return jsonify({"committed": json_int(exp.committed_value())})
+
+
+@app.post("/api/experiments/<exp_id>/checkpoint")
+def experiment_checkpoint(exp_id):
+    exp = get_experiment(exp_id)
+    if exp is None:
+        return jsonify({"error": "experiment not found"}), 404
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode")
+    if mode not in VALID_CP_MODES:
+        return jsonify({"error": "mode must be PASSIVE or TRUNCATE"}), 400
+    try:
+        result = exp.run_checkpoint(mode)
+    except sqlite3.Error as exc:
+        # 极端情况下（如 I/O 错误）如实上报，不影响两栏连接。
+        name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+        code = getattr(exc, "sqlite_errorcode", None)
+        exp.add_checkpoint_log(
+            "%s → 失败 [%s (%s)] %s" % (mode, name, code, exc)
+        )
+        return jsonify(
+            {
+                "ok": False,
+                "error": {"name": name, "code": code, "message": str(exc)},
+                "checkpoint": exp.checkpoint_state(),
+            }
+        )
+    return jsonify({"ok": True, "error": None, "result": result})
 
 
 @app.post("/api/experiments/<exp_id>/conn/<side>/op")

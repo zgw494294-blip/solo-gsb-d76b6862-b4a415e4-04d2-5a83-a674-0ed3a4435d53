@@ -1,7 +1,7 @@
 "use strict";
 
 let expId = null;
-const lastRender = { a: "", b: "" };
+const lastRender = { a: "", b: "", cp: "" };
 
 const $ = (id) => document.getElementById(id);
 
@@ -37,6 +37,7 @@ async function refreshStatus() {
   const data = await fetchJson(`/api/experiments/${expId}/status`);
   renderPanel("a", data.a);
   renderPanel("b", data.b);
+  renderCheckpoint(data.checkpoint);
 }
 
 async function refreshCommitted() {
@@ -74,6 +75,67 @@ function renderPanel(side, state) {
     logEl.appendChild(li);
   }
   logEl.scrollTop = logEl.scrollHeight;
+}
+
+function renderCheckpoint(state) {
+  const key = JSON.stringify(state);
+  if (lastRender.cp === key) return;
+  lastRender.cp = key;
+
+  const resultEl = $("cp-result");
+  const last = state && state.last;
+  if (!last) {
+    resultEl.textContent = "尚未执行检查点。返回格式：(busy, WAL总帧数, 已回写帧数)";
+    resultEl.classList.remove("cp-busy");
+  } else {
+    resultEl.textContent =
+      `模式 ${last.mode}：busy=${last.busy}，WAL总帧数=${last.total_frames}，` +
+      `已回写帧数=${last.checkpointed_frames}；操作后 WAL 文件 = ${last.wal_bytes} 字节` +
+      (last.wal_bytes === 0 ? "（文件不存在或为 0 字节）" : "");
+    resultEl.classList.toggle("cp-busy", last.busy === 1);
+  }
+
+  const logEl = $("cp-log");
+  logEl.innerHTML = "";
+  for (const entry of (state && state.log) || []) {
+    const li = document.createElement("li");
+    li.textContent = entry;
+    logEl.appendChild(li);
+  }
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setCheckpointBusy(busy) {
+  for (const btn of document.querySelectorAll(".checkpoint-panel button")) {
+    btn.disabled = busy;
+  }
+}
+
+async function doCheckpoint(mode) {
+  setCheckpointBusy(true);
+  try {
+    const data = await fetchJson(`/api/experiments/${expId}/checkpoint`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    if (!data.ok && data.error) {
+      // 检查点自身的异常只显示在结果行，不影响两栏
+      renderCheckpoint(data.checkpoint || { last: null, log: [] });
+      $("cp-result").textContent =
+        `${data.error.name}（错误码 ${data.error.code}）：${data.error.message}`;
+      return;
+    }
+    // 主动拉取一次状态，拿到服务端记录的日志；之后继续由轮询只读刷新
+    await refreshStatus();
+    await refreshCommitted();
+  } catch (e) {
+    if (!(e instanceof ExpGone)) {
+      $("cp-result").textContent = "请求失败：" + e.message;
+    }
+  } finally {
+    setCheckpointBusy(false);
+  }
 }
 
 function setBusy(side, busy) {
@@ -144,6 +206,9 @@ function bindPanel(side) {
 async function init() {
   bindPanel("a");
   bindPanel("b");
+  for (const btn of document.querySelectorAll(".checkpoint-panel button[data-cp]")) {
+    btn.addEventListener("click", () => doCheckpoint(btn.dataset.cp));
+  }
   $("new-exp").addEventListener("click", () => {
     newExperiment().catch(() => {});
   });

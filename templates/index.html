@@ -62,9 +62,23 @@
     </section>
   </main>
 
+  <section class="checkpoint-panel">
+    <h2>WAL 检查点（独立连接真实执行 PRAGMA wal_checkpoint，busy_timeout=0）</h2>
+    <div class="controls">
+      <button type="button" data-cp="PASSIVE">PASSIVE 检查点</button>
+      <button type="button" data-cp="TRUNCATE">TRUNCATE 检查点</button>
+    </div>
+    <div class="cp-result" id="cp-result">
+      尚未执行检查点。返回格式：(busy, WAL总帧数, 已回写帧数)
+    </div>
+    <ol class="log cp-log" id="cp-log"></ol>
+  </section>
+
   <footer>
-    <p>说明：状态刷新不执行任何 SELECT，不会为 DEFERRED 事务提前建立快照；写锁冲突会立即返回
-       SQLite 错误名与错误码，不阻塞另一栏，也不会自动结束失败的事务；修改操作只允许在事务内进行。</p>
+    <p>说明：状态刷新不执行任何 SELECT 或 PRAGMA wal_checkpoint，只读内存缓存，
+       不会为 DEFERRED 事务提前建立快照，也不会触发检查点；检查点由临时独立连接执行，
+       不替两栏提交、回滚或更换连接；写锁冲突会立即返回 SQLite 错误名与错误码，
+       不阻塞另一栏，也不会自动结束失败的事务；修改操作只允许在事务内进行。</p>
   </footer>
 
   <script src="{{ url_for('static', filename='app.js') }}"></script>

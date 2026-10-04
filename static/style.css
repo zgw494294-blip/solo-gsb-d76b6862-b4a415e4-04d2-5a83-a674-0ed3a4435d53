@@ -179,6 +179,43 @@ header button:hover:not(:disabled) {
 
 .log li.log-error { color: #fca5a5; }
 
+.checkpoint-panel {
+  margin: 0 20px 16px;
+  background: #fff;
+  border: 1px solid #e2e5ea;
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+
+.checkpoint-panel h2 {
+  margin: 0 0 10px;
+  font-size: 16px;
+}
+
+.cp-result {
+  background: #eef4ff;
+  border: 1px solid #bfd3ff;
+  color: #1e3a8a;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13.5px;
+  margin-bottom: 10px;
+  font-family: ui-monospace, Consolas, monospace;
+  word-break: break-all;
+}
+
+.cp-result.cp-busy {
+  background: #fff7ed;
+  border-color: #fdba74;
+  color: #9a3412;
+}
+
+.cp-log {
+  max-height: 150px;
+  min-height: 60px;
+  margin-bottom: 0;
+}
+
 footer {
   padding: 0 20px 16px;
   color: #6b7280;
